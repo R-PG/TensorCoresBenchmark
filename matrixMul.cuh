@@ -1,79 +1,42 @@
-#include <assert.h>
-#include <cuda_runtime.h>
-#include <cuda.h>
 #include <cublasLt.h>
 #include "cublas_v2.h"
 #include <cstdlib>
+#include "helpers.h"
 #include <limits>
 #include <mma.h>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
+#include <random>
 
-#define IDX2C(i,j,ld) (((j)*(ld))+(i))
+#define IDX2C(i,j,ld) (((j)*(ld))+(i))  // Operator to convert: Column Mayor Layout INDEXING -> Row Mayor Storage
 #ifndef MATRIXMUL_CUH
 #define MATRIXMUL_CUH
 
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 struct MatrixMul
 {
-    MatrixType a[M * K];
-    MatrixType b[K * N];
+    MatrixType a[M][K];
+    MatrixType b[K][N];
 
     MatrixMul();
 
     void runTest(bool display = false);
 };
 
-std::ostream& operator<<(std::ostream& os, const half& value) {
-    os << static_cast<float>(value); // Assuming half is convertible to float
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const int8_t& value) {
-    os << static_cast<int>(value); // Assuming half is convertible to float
-    return os;
-}
-
-template<typename T, std::size_t N>
-void printMatrix(const T(&a)[N], std::size_t ld)
-{
-    for(std::size_t i = 0; i < ld; ++i)
-    {
-        for(std::size_t j = 0; j < N/ld; ++j)
-        {
-            std::cout << std::setw(10) << std::fixed << std::setprecision(10) << a[IDX2C(i,j,ld)] << " ";
-        }
-        std::cout << std::endl;
-    }
-    std::cout << std::endl;
-}
-
-inline void checkCudaStatus(cudaError_t status) {
-    if (status != cudaSuccess) {
-        std::cout << "cuda API failed with status " << status << ": " << cudaGetErrorString(status) << std::endl;
-        throw std::logic_error("cuda API failed");
-    }
-};
-
-inline void checkCublasStatus(cublasStatus_t status) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("cuBLAS API failed with status %d\n", status);
-        throw std::logic_error("cuBLAS API failed");
-    }
-}
-
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
-MatrixMul<MatrixType,AccumulatorType,M,N,K>::MatrixMul(){
+MatrixMul<MatrixType,AccumulatorType,M,N,K>::MatrixMul(){    
+    std::random_device rd;  // Will be used to obtain a seed for the random number engine
+    std::mt19937 gen(rd()); // Standard mersenne_twister_engine seeded with rd()
+    //std::uniform_real_distribution<> dis(std::numeric_limits<MatrixType>::min(), std::numeric_limits<MatrixType>::max());
+    std::uniform_real_distribution<> dis(0, 9);
+
     for (int i{0}; i < M; i++)
         for (int j{0}; j < K; j++)
-            {   
-                a[IDX2C(i,j,M)] = (MatrixType)((double)((std::rand() % 4) + 1)/(double)((std::rand() % 6) + 1));
+            {
+                a[i][j] = (MatrixType) dis(gen);
             }
     for (int i{0}; i < K; i++)
         for (int j{0}; j < N; j++)
             {
-                b[IDX2C(i,j,K)] = (MatrixType)((double)((std::rand() % 4) + 1)/(double)((std::rand() % 6) + 1));;
+                b[i][j] = (MatrixType) dis(gen);
             }
 };
 
@@ -88,9 +51,9 @@ __global__ void matrixMultiplicationKernel(T* A, T* B, T* C) // A way to adapt t
         T sum = 0;
         // Perform dot product of row of A and column of B to compute C[row][col]
         for (int i = 0; i < K; ++i) {
-            sum += A[row + i * M] * B[col * K + i];
+            sum += A[row + M * i] * B[col * K + i];
         }
-        C[row + col * M] = sum;
+        C[col * M + row] = sum;
     //}
     // COLUMN MAYOR LAYOUT
 }
@@ -119,20 +82,21 @@ int roundoff(int v, int d) {
 }
 
 /// Use cublasLtMatmul to perform tensor-op Igemm with memory order transforms on all buffers
-///
+///int8_t
 /// For better performance data order transforms should be offline as much as possible.
 ///
 /// transa, transb assumed N; alpha, beta are host pointers, tensor ops allowed, alpha assumed 1, beta assumed 0,
 /// stream assumed 0
+template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 void LtIgemmTensor(cublasLtHandle_t ltHandle,
                    int m,
                    int n,
                    int k,
-                   const int8_t *A,
+                   const MatrixType *A,
                    int lda,
-                   const int8_t *B,
+                   const MatrixType *B,
                    int ldb,
-                   int32_t *C,
+                   AccumulatorType *C,
                    int ldc) {
     cublasLtMatmulDesc_t matmulDesc = NULL;
     cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
@@ -234,74 +198,185 @@ void LtIgemmTensor(cublasLtHandle_t ltHandle,
     if (Atransform) checkCudaStatus(cudaFree(Atransform));
 }
 
+/// Sample wrapper executing single precision gemm with cublasLtMatmul, nearly a drop-in replacement for cublasSgemm,
+/// with addition of the workspace to support split-K algorithms
+///
+/// pointer mode is always host, to change it configure the appropriate matmul descriptor attribute
+/// matmul is not using cublas handle's configuration of math mode, here tensor ops are implicitly allowed; to change
+/// this configure appropriate attribute in the preference handle
+void LtSgemm(cublasLtHandle_t ltHandle,
+             cublasOperation_t transa,
+             cublasOperation_t transb,
+             int m,
+             int n,
+             int k,
+             const float *alpha, /* host pointer */
+             const float *A,
+             int lda,
+             const float *B,
+             int ldb,
+             const float *beta, /* host pointer */
+             float *C,
+             int ldc,
+             void *workspace,
+             size_t workspaceSize) {
+    cublasLtMatmulDesc_t operationDesc = NULL;
+    cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
+    cublasLtMatmulPreference_t preference = NULL;
+
+    int returnedResults                             = 0;
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+
+    // create operation desciriptor; see cublasLtMatmulDescAttributes_t for details about defaults; here we just need to
+    // set the transforms for A and B
+    checkCublasStatus(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    checkCublasStatus(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+    checkCublasStatus(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+    // create matrix descriptors, we are good with the details here so no need to set any extra attributes
+    checkCublasStatus(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_32F, transa == CUBLAS_OP_N ? m : k, transa == CUBLAS_OP_N ? k : m, lda));
+    checkCublasStatus(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_32F, transb == CUBLAS_OP_N ? k : n, transb == CUBLAS_OP_N ? n : k, ldb));
+    checkCublasStatus(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32F, m, n, ldc));
+
+    // create preference handle; here we could use extra attributes to disable tensor ops or to make sure algo selected
+    // will work with badly aligned A, B, C; here for simplicity we just assume A,B,C are always well aligned (e.g.
+    // directly come from cudaMalloc)
+    checkCublasStatus(cublasLtMatmulPreferenceCreate(&preference));
+    checkCublasStatus(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceSize, sizeof(workspaceSize)));
+
+    // we just need the best available heuristic to try and run matmul. There is no guarantee this will work, e.g. if A
+    // is badly aligned, you can request more (e.g. 32) algos and try to run them one by one until something works
+    checkCublasStatus(cublasLtMatmulAlgoGetHeuristic(ltHandle, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
+
+    if (returnedResults == 0) {
+        checkCublasStatus(CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+
+    checkCublasStatus(cublasLtMatmul(ltHandle,
+                                     operationDesc,
+                                     alpha,
+                                     A,
+                                     Adesc,
+                                     B,
+                                     Bdesc,
+                                     beta,
+                                     C,
+                                     Cdesc,
+                                     C,
+                                     Cdesc,
+                                     &heuristicResult.algo,
+                                     workspace,
+                                     workspaceSize,
+                                     0));
+
+    // descriptors are no longer needed as all GPU work was already enqueued
+    if (preference) checkCublasStatus(cublasLtMatmulPreferenceDestroy(preference));
+    if (Cdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Cdesc));
+    if (Bdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Bdesc));
+    if (Adesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Adesc));
+    if (operationDesc) checkCublasStatus(cublasLtMatmulDescDestroy(operationDesc));
+}
+
+template<typename T, std::size_t M, std::size_t N>
+T* allocateCMLDevice(const T(&a)[M][N])
+{
+    T temp[M * N], *d;
+    checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
+    for (int i{0}; i < M; ++i)
+        for (int j{0}; j < N; ++j)
+            temp[IDX2C(i,j,M)] = a[i][j];
+    checkCudaStatus(cudaMemcpy(d, temp, sizeof(T) * M * N, cudaMemcpyHostToDevice));
+    return d;
+}
 
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
-    MatrixType *d_a, *d_b;
-    AccumulatorType *d_c;
-
-    // Allocate device memory
-    checkCudaStatus(cudaMalloc((void **)&d_a, sizeof(MatrixType) * M * K));
-    checkCudaStatus(cudaMalloc((void **)&d_b, sizeof(MatrixType) * K * N));
-    checkCudaStatus(cudaMalloc((void **)&d_c, sizeof(AccumulatorType) * M * N));
-
-    // Transfer data from host to device memory
-    checkCudaStatus(cudaMemcpy(d_a, a, sizeof(MatrixType) * M * K, cudaMemcpyHostToDevice));
-    checkCudaStatus(cudaMemcpy(d_b, b, sizeof(MatrixType) * K * N, cudaMemcpyHostToDevice));
-    checkCudaStatus(cudaMemset(d_c, 0, M * N));
-
-    //  Run nonTensorTest
-    dim3 numBlocks(1);
-    dim3 threadsPerBlock(M,N);
-    ////////////////
-    MatrixType *sameTypeDeviceC; // How to handle the difference of types?????
-    checkCudaStatus(cudaMalloc((void **)&sameTypeDeviceC, sizeof(MatrixType) * M * N));
-    checkCudaStatus(cudaMemset(sameTypeDeviceC, 0, M * N));
-    ////////////////
-    matrixMultiplicationKernel<MatrixType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, sameTypeDeviceC);
-
-    MatrixType nonTensorResult[M * N];
-    checkCudaStatus(cudaMemcpy(nonTensorResult, sameTypeDeviceC, sizeof(MatrixType) * M * N, cudaMemcpyDeviceToHost));
-
-    //  WMMA Test
-    checkCudaStatus(cudaMemset(d_c, 0, M * N));
-
-    wmma_ker<MatrixType,AccumulatorType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c);
-
-    AccumulatorType tensorResult[M * N];
-    checkCudaStatus(cudaMemcpy(tensorResult, d_c, sizeof(AccumulatorType) * M * N, cudaMemcpyDeviceToHost));
-
-    // Cublas
-    cublasLtHandle_t ltHandle;
-    checkCublasStatus(cublasLtCreate(&ltHandle));
-    AccumulatorType cublasResult[M * N];
-    LtIgemmTensor(ltHandle,M,N,K,a,M,b,K,cublasResult,M);
-
-    auto& result = cublasResult;
-    AccumulatorType residualMatrix[M * N];
-    // Check Result
-    for(int i = 0; i < M; i++)
-        for (int j = 0; j < N; j++)
-        {
-            residualMatrix[IDX2C(i,j,M)] = (AccumulatorType) nonTensorResult[IDX2C(i,j,M)] - result[IDX2C(i,j,M)];
-        }
+    MatrixType *d_a = NULL, *d_b = NULL;
+    AccumulatorType *d_c = NULL;
 
     if (display)
     {
         std::cout << "Matrix A: " << std::endl;
-        printMatrix(a,M);
+        printMatrix(a);
         std::cout << "Matrix B: " << std::endl;
-        printMatrix(b,K);
-        std::cout << "Regular Kernel Result: " << std::endl;
-        printMatrix(nonTensorResult,M);
-        std::cout << "wmma result: " << std::endl;
-        printMatrix(tensorResult,M);
-        std::cout << "CUBLAS result: " << std::endl;
-        printMatrix(cublasResult,M);
-        std::cout << "Residual matrix: " << std::endl;
-        printMatrix(residualMatrix,M);
-        std::cout << std::endl << std::endl;
+        printMatrix(b);
     }
+    
+    d_a = allocateCMLDevice(a);
+    d_b = allocateCMLDevice(b);
+    d_c = allocateCMLDevice<AccumulatorType,M,N>();
+
+    dim3 numBlocks(1);
+    dim3 threadsPerBlock(M,N);
+
+    //  Run nonTensorTest
+    if constexpr(1){
+        MatrixType* d_d = allocateCMLDevice<MatrixType,M,N>();
+
+        matrixMultiplicationKernel<MatrixType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_d);
+
+        MatrixType nonTensorResult[M][N];
+        retrieveCMLDevice(nonTensorResult, d_d);
+        checkCudaStatus(cudaFree(d_d));
+        
+        if (display)
+        {
+            std::cout << "Regular Kernel Result: " << std::endl;
+            printMatrix(nonTensorResult);
+        }
+    }
+
+    //  WMMA Test
+    if constexpr(0)
+    {   
+        checkCudaStatus(cudaMemset(d_c, 0, M * N));
+
+        wmma_ker<MatrixType,AccumulatorType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c);
+
+        AccumulatorType wmmaResult[M * N];
+        retrieveCMLDevice(wmmaResult, d_c);
+
+        if (display)
+        {
+            std::cout << "WMMA Result: " << std::endl;
+            printMatrix(wmmaResult);
+        }
+    }
+
+    // // Cublas
+    cublasLtHandle_t ltHandle;
+    checkCublasStatus(cublasLtCreate(&ltHandle));
+    // AccumulatorType cublasResult[M * N];
+    // //LtIgemmTensor<MatrixType,AccumulatorType,M,N,K>(ltHandle,M,N,K,a,M,b,K,cublasResult,M);
+    
+    const float alpha {1.f};
+    const float beta {0.f};
+    void *workspace;
+    size_t workspaceSize = 1024 * 1024 * 4;
+    checkCudaStatus(cudaMalloc((void **)&workspace, workspaceSize));
+    checkCudaStatus(cudaMemset(d_c, 0, M * N));
+
+    LtSgemm(ltHandle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, d_a, M, d_b, K, &beta, d_c, M, workspace, workspaceSize);
+    checkCudaStatus(cudaFree(workspace));
+    
+    AccumulatorType cublasResult[M][N];
+    retrieveCMLDevice(cublasResult, d_c);
+        
+    if (display)
+    {
+        std::cout << "OINK: " << std::endl;
+        printMatrix(cublasResult);
+    }
+
+    // auto& result = cublasResult;
+    // AccumulatorType residualMatrix[M * N];
+    // Check Result
+    // for(int i = 0; i < M; i++)
+    //     for (int j = 0; j < N; j++)
+    //     {
+    //         residualMatrix[IDX2C(i,j,M)] = (AccumulatorType) nonTensorResult[IDX2C(i,j,M)] - result[IDX2C(i,j,M)];
+    //     }
+
     // Deallocate device memory
     checkCudaStatus(cudaFree(d_a));
     checkCudaStatus(cudaFree(d_b));

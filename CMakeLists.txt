@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 # Set the project name and enable CUDA
-project(MatrixMultiplication LANGUAGES CXX CUDA)
+project(test LANGUAGES CXX CUDA)
 
 # Specify the minimum required C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -23,8 +23,15 @@ target_compile_options(test PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-g -gencode arch=compute_86,code=sm_86>
 )
 
-# If you need to include additional directories
-# target_include_directories(MatrixMul PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(CUDART_LIBRARY cudart)
+set(CUBLASLT_LIBRARY cublasLt)
 
-# If you need to link additional libraries, use target_link_libraries
-# target_link_libraries(MatrixMul PRIVATE some_library)
+if(NOT WIN32)
+    find_library(CUDART_LIBRARY cudart ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+    find_library(CUBLASLT_LIBRARY cublasLt ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+endif()
+
+target_link_libraries(${PROJECT_NAME}
+    ${CUDART_LIBRARY}
+    ${CUBLASLT_LIBRARY}
+)
