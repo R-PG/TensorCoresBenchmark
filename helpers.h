@@ -4,6 +4,8 @@
 #include <iomanip>
 #include <sstream>
 
+#define IDX2C(i,j,ld) (((j)*(ld))+(i))  // Operator to convert: Column Mayor Layout INDEXING -> Row Mayor Storage
+
 std::ostream& operator<<(std::ostream& os, const half& value) {
     os << static_cast<float>(value); // Assuming half is convertible to float
     return os;
@@ -43,6 +45,18 @@ inline void checkCublasStatus(cublasStatus_t status) {
 }
 
 template<typename T, std::size_t M, std::size_t N>
+T* allocateCMLDevice(const T(&a)[M][N])
+{
+    T temp[M * N], *d;
+    checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
+    for (int i{0}; i < M; ++i)
+        for (int j{0}; j < N; ++j)
+            temp[IDX2C(i,j,M)] = a[i][j];
+    checkCudaStatus(cudaMemcpy(d, temp, sizeof(T) * M * N, cudaMemcpyHostToDevice));
+    return d;
+}
+
+template<typename T, std::size_t M, std::size_t N>
 T* allocateCMLDevice()
 {
     T* d;
@@ -60,3 +74,30 @@ void retrieveCMLDevice(T(&a)[M][N], T* d)
         for (int j{0}; j < N; ++j)
             a[i][j] = temp[j * M + i];
 }
+
+/*
+    Get compile time compute type based on the Scale Type and Atype/Btype 
+*/
+template<cudaDataType_t ScaleType, cudaDataType_t ABtype>
+struct computeType {};
+
+template<>
+struct computeType<CUDA_R_16F,CUDA_R_32F> {static const cublasComputeType_t type = CUBLAS_COMPUTE_32F;};
+
+template<>
+struct computeType<CUDA_R_16F,CUDA_R_16F> {static const cublasComputeType_t type = CUBLAS_COMPUTE_16F;};
+
+template<>
+struct computeType<CUDA_R_64F,CUDA_R_64F> {static const cublasComputeType_t type = CUBLAS_COMPUTE_64F;};
+
+template<typename T>
+struct cudaType {};
+
+template<>
+struct cudaType<half> {static const cudaDataType_t type = CUDA_R_16F;};
+
+template<>
+struct cudaType<float> {static const cudaDataType_t type = CUDA_R_32F;};
+
+template<>
+struct cudaType<double> {static const cudaDataType_t type = CUDA_R_64F;};
