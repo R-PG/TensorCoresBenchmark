@@ -57,6 +57,18 @@ T* allocateCMLDevice(const T(&a)[M][N])
 }
 
 template<typename T, std::size_t M, std::size_t N>
+T* allocateRMLDevice(const T(&a)[M][N])
+{
+    T temp[M * N], *d;
+    checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
+    for (int i{0}; i < M; ++i)
+        for (int j{0}; j < N; ++j)
+            temp[i * M + j] = a[i][j];
+    checkCudaStatus(cudaMemcpy(d, temp, sizeof(T) * M * N, cudaMemcpyHostToDevice));
+    return d;
+}
+
+template<typename T, std::size_t M, std::size_t N>
 T* allocateCMLDevice()
 {
     T* d;

@@ -58,22 +58,24 @@ __global__ void matrixMultiplicationKernel(MatrixType* A, MatrixType* B, Accumul
 }
 
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
-__global__ void wmma_ker(const MatrixType *a, const MatrixType *b, AccumulatorType *c)
+__global__ void wmma_ker(const MatrixType *a, const MatrixType *b, AccumulatorType *c, 
+                        size_t p, size_t q, size_t pMask, size_t qMask, size_t pDesp, size_t qDesp)
 {
-    //auto w = warpSize;
+    size_t aDesp = (threadIdx.y & pMask) >> pDesp;
+    size_t bDesp = (threadIdx.y & qMask) >> qDesp;
     // Declare the fragments
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, M, N, K, MatrixType, nvcuda::wmma::col_major> a_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, M, N, K, MatrixType, nvcuda::wmma::col_major> b_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, M, N, K, AccumulatorType> c_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, MatrixType, nvcuda::wmma::col_major> a_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, MatrixType, nvcuda::wmma::col_major> b_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, AccumulatorType> c_frag;
     // Initialize the output to zero
     nvcuda::wmma::fill_fragment(c_frag, 0.0f);
     // Load the inputs
-    nvcuda::wmma::load_matrix_sync(a_frag, a, M);
-    nvcuda::wmma::load_matrix_sync(b_frag, b, K);
+    nvcuda::wmma::load_matrix_sync(a_frag, a + M/p * aDesp, M);
+    nvcuda::wmma::load_matrix_sync(b_frag, b + K*N/q * bDesp, K);
     // Perform the matrix multiplication
     nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
     // Store the output
-    nvcuda::wmma::store_matrix_sync(c, c_frag, M, nvcuda::wmma::mem_col_major);
+    nvcuda::wmma::store_matrix_sync(c + M/p * aDesp + M*N/q * bDesp, c_frag, M, nvcuda::wmma::mem_col_major);
 }
 
 int roundoff(int v, int d) {
@@ -281,7 +283,7 @@ void LtSgemm(cublasLtHandle_t ltHandle,
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
     MatrixType *d_a = NULL, *d_b = NULL;
-    AccumulatorType *d_c = NULL;
+    AccumulatorType *d_c = NULL, wmmaResult[M][N], cublasResult[M][N];
 
     if (display)
     {
@@ -312,14 +314,37 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         }
     //}
 
-    threadsPerBlock = dim3(1,32);
-    //  WMMA Test
-    //if constexpr(1){   
-        checkCudaStatus(cudaMemset(d_c, 0, M * N));
+    // WMMA
+    {
+        size_t p = M/8;
+        size_t q = N/8;
+        size_t pMask{0};
+        size_t qMask{0};
+        size_t pDesp{0};
+        size_t qDesp{0};
+        size_t pDigits = std::ceil(std::log2((float)p));
+        size_t qDigits = std::ceil(std::log2((float)q));
 
-        wmma_ker<MatrixType,AccumulatorType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c);
+        if (p > q)
+        {
+            for(int i{0}; i < qDigits; i++) qMask |= (1 << i);
+            for(int i{0}; i < pDigits; i++) pMask |= (1 << (i + qDigits));
+            pDesp = qDigits;
+        }
+        else
+        {
+            for(int i{0}; i < pDigits; i++) pMask |= (1 << i);
+            for(int i{0}; i < qDigits; i++) qMask |= (1 << (i + pDigits));
+            qDesp = pDigits;
+        }
 
-        AccumulatorType wmmaResult[M][N];
+        checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
+
+        threadsPerBlock = dim3(32,1 * p * q);
+
+        wmma_ker<MatrixType,AccumulatorType,M,N,K>
+        <<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c,p,q,pMask,qMask,pDesp,qDesp);
+
         retrieveCMLDevice(wmmaResult, d_c);
 
         if (display)
@@ -327,11 +352,10 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
             std::cout << "WMMA Result: " << std::endl;
             printMatrix(wmmaResult);
         }
-    //}
+    }
 
-    // Cublas
-    if constexpr(1)
-    {   
+    // Cublas 
+    {
         cublasLtHandle_t ltHandle;
         checkCublasStatus(cublasLtCreate(&ltHandle));
         // AccumulatorType cublasResult[M * N];
@@ -342,32 +366,48 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         void *workspace;
         size_t workspaceSize = 1024 * 1024 * 4;
         checkCudaStatus(cudaMalloc((void **)&workspace, workspaceSize));
-        checkCudaStatus(cudaMemset(d_c, 0, M * N));
+        checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
 
         LtSgemm<AccumulatorType,MatrixType,AccumulatorType>(ltHandle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, d_a, M, d_b, K, &beta, d_c, M, workspace, workspaceSize);
         checkCudaStatus(cudaFree(workspace));
         
-        AccumulatorType cublasResult[M][N];
         retrieveCMLDevice(cublasResult, d_c);
         if (display)
         {   
-            std::cout << "WMMA Result: " << std::endl;
+            std::cout << "CuBLAS Result: " << std::endl;
             printMatrix(cublasResult);
-        }
-    }    
+        } 
+    }
 
     AccumulatorType residualMatrix[M][N];
     auto& result = wmmaResult;
-    
+    bool passed = true;
+
     for(int i = 0; i < M; i++)
         for (int j = 0; j < N; j++)
+        {
             residualMatrix[i][j] = (AccumulatorType) nonTensorResult[i][j] - result[i][j];
+            if (residualMatrix[i][j] != 0) passed = false;
+        }
 
-    for(int i = 0; i < M; i++)
-        for (int j = 0; j < N; j++)
-            if (residualMatrix[i][j] != 0) 
-                std::cout << i << "," << j << ": " << residualMatrix[i][j] << std::endl;
+    std::cout << "PASSED: " << passed << std::endl; 
 
+    if (display)
+    {
+        for(int i = 0; i < M; i++)
+        {
+            for (int j = 0; j < N; j++)
+            {
+                if (residualMatrix[i][j] != 0) 
+                    //std::cout << i << "," << j << ": " << residualMatrix[i][j] << std::endl;
+                    std::cout << "1 ";
+                else
+                    std::cout << "0 ";
+
+            }
+            std::cout << std::endl;
+        }
+    }
     // Deallocate device memory
     checkCudaStatus(cudaFree(d_a));
     checkCudaStatus(cudaFree(d_b));
