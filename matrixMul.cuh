@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include "helpers.h"
 #include <limits>
-#include <mma.h>
 #include <random>
 
 #ifndef MATRIXMUL_CUH
@@ -14,6 +13,11 @@ struct MatrixMul
 {
     MatrixType a[M][K];
     MatrixType b[K][N];
+
+    // WMMA dimensions
+    static const size_t WMMA_M = wmmaTileSize<MatrixType,AccumulatorType>::M;
+    static const size_t WMMA_N = wmmaTileSize<MatrixType,AccumulatorType>::N;
+    static const size_t WMMA_K = wmmaTileSize<MatrixType,AccumulatorType>::K;
 
     MatrixMul();
 
@@ -57,25 +61,69 @@ __global__ void matrixMultiplicationKernel(MatrixType* A, MatrixType* B, Accumul
     // COLUMN MAYOR LAYOUT
 }
 
-template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
-__global__ void wmma_ker(const MatrixType *a, const MatrixType *b, AccumulatorType *c, 
-                        size_t p, size_t q, size_t pMask, size_t qMask, size_t pDesp, size_t qDesp)
+// Performs an MxNxK GEMM (C=alpha*A*B + beta*C) assuming:
+//  1) Matrices are packed in memory.
+//  2) M, N and K are multiples of 16. 
+//  3) Neither A nor B are transposed.
+// Note: This is NOT a high performance example but is for demonstration purposes only
+//       For a high performance code please use the GEMM provided in cuBLAS.
+template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K, 
+std::size_t WMMA_M, std::size_t WMMA_N, std::size_t WMMA_K>
+__global__ void wmma_ker(const MatrixType *a, const MatrixType *b, AccumulatorType *c, AccumulatorType alpha, 
+AccumulatorType beta) 
 {
-    size_t aDesp = (threadIdx.y & pMask) >> pDesp;
-    size_t bDesp = (threadIdx.y & qMask) >> qDesp;
-    // Declare the fragments
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 8, 8, 4, MatrixType, nvcuda::wmma::col_major> a_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 8, 8, 4, MatrixType, nvcuda::wmma::col_major> b_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 4, AccumulatorType> c_frag;
-    // Initialize the output to zero
-    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
-    // Load the inputs
-    nvcuda::wmma::load_matrix_sync(a_frag, a + M/p * aDesp, M);
-    nvcuda::wmma::load_matrix_sync(b_frag, b + K*N/q * bDesp, K);
-    // Perform the matrix multiplication
-    nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    // Store the output
-    nvcuda::wmma::store_matrix_sync(c + M/p * aDesp + M*N/q * bDesp, c_frag, M, nvcuda::wmma::mem_col_major);
+   // Leading dimensions. Packed with no transpositions.
+   int lda = M;
+   int ldb = K;
+   int ldc = M;
+
+   // Tile using a 2D grid
+   int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+   int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
+ 
+   // Declare the fragments
+   nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, MatrixType, nvcuda::wmma::col_major> a_frag;
+   nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, MatrixType, nvcuda::wmma::col_major> b_frag;
+   nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, AccumulatorType> acc_frag;
+   nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, AccumulatorType> c_frag;
+
+   nvcuda::wmma::fill_fragment(acc_frag, 0.0f);
+
+   // Loop over k
+   for (int i = 0; i < K; i += WMMA_K) {
+      int aRow = warpM * WMMA_M;
+      int aCol = i;
+
+      int bRow = i;
+      int bCol = warpN * WMMA_N;
+
+      // Bounds checking
+      if (aRow < M && aCol < K && bRow < K && bCol < N) {
+         // Load the inputs
+         nvcuda::wmma::load_matrix_sync(a_frag, a + aRow + aCol * lda, lda);
+         nvcuda::wmma::load_matrix_sync(b_frag, b + bRow + bCol * ldb, ldb);
+
+         // Perform the matrix multiplication
+         nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+
+      }
+   }
+
+   // Load in the current value of c, scale it by beta, and add this our result scaled by alpha
+   int cRow = warpM * WMMA_M;
+   int cCol = warpN * WMMA_N;
+
+   if (cRow < M && cCol < N) {
+      nvcuda::wmma::load_matrix_sync(c_frag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
+
+#pragma unroll
+      for(int i=0; i < c_frag.num_elements; i++) {
+         c_frag.x[i] = alpha * acc_frag.x[i] + beta * c_frag.x[i];
+      }
+
+      // Store the output
+      nvcuda::wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag, ldc, nvcuda::wmma::mem_col_major);
+   }
 }
 
 int roundoff(int v, int d) {
@@ -283,86 +331,54 @@ void LtSgemm(cublasLtHandle_t ltHandle,
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
     MatrixType *d_a = NULL, *d_b = NULL;
-    AccumulatorType *d_c = NULL, wmmaResult[M][N], cublasResult[M][N];
+    AccumulatorType *d_c = NULL, wmmaResult[M][N], cublasResult[M][N], alpha {1}, beta {0};
 
-    if (display)
-    {
-        std::cout << "Matrix A: " << std::endl;
-        printMatrix(a);
-        std::cout << "Matrix B: " << std::endl;
-        printMatrix(b);
-    }
-    
+    // if (display)
+    // {
+    //     std::cout << "Matrix A: " << std::endl;
+    //     printMatrix(a);
+    //     std::cout << "Matrix B: " << std::endl;
+    //     printMatrix(b);
+    // }
+
     d_a = allocateCMLDevice(a);
     d_b = allocateCMLDevice(b);
     d_c = allocateCMLDevice<AccumulatorType,M,N>();
 
-    dim3 numBlocks(1);
-    dim3 threadsPerBlock(M,N);
-
-    //  Run nonTensorTest
-    //if constexpr(1){
-        matrixMultiplicationKernel<MatrixType,AccumulatorType,M,N,K><<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c);
-
-        AccumulatorType nonTensorResult[M][N];
-        retrieveCMLDevice(nonTensorResult, d_c);
-        
-        if (display)
-        {
-            std::cout << "Regular Kernel Result: " << std::endl;
-            printMatrix(nonTensorResult);
-        }
-    //}
-
     // WMMA
     {
-        size_t p = M/8;
-        size_t q = N/8;
-        size_t pMask{0};
-        size_t qMask{0};
-        size_t pDesp{0};
-        size_t qDesp{0};
-        size_t pDigits = std::ceil(std::log2((float)p));
-        size_t qDigits = std::ceil(std::log2((float)q));
-
-        if (p > q)
-        {
-            for(int i{0}; i < qDigits; i++) qMask |= (1 << i);
-            for(int i{0}; i < pDigits; i++) pMask |= (1 << (i + qDigits));
-            pDesp = qDigits;
-        }
-        else
-        {
-            for(int i{0}; i < pDigits; i++) pMask |= (1 << i);
-            for(int i{0}; i < qDigits; i++) qMask |= (1 << (i + pDigits));
-            qDesp = pDigits;
-        }
-
         checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
 
-        threadsPerBlock = dim3(32,1 * p * q);
+        dim3 gridDim;
+        dim3 blockDim;
 
-        wmma_ker<MatrixType,AccumulatorType,M,N,K>
-        <<<numBlocks,threadsPerBlock>>>(d_a, d_b, d_c,p,q,pMask,qMask,pDesp,qDesp);
+        // blockDim.x must be a multple of warpSize
+        // 128x4 means we have 16 warps and a block computes a 64x64 output tile
+        blockDim.x = 128;
+        blockDim.y = 4;
+
+        gridDim.x = (M + (WMMA_M * blockDim.x / 32 - 1)) / (WMMA_M * blockDim.x / 32);
+        gridDim.y = (N + WMMA_N * blockDim.y - 1) / (WMMA_N * blockDim.y);
+
+        wmma_ker<MatrixType,AccumulatorType,M,N,K,WMMA_M,WMMA_N,WMMA_K>
+        <<<gridDim,blockDim>>>(d_a, d_b, d_c, alpha, beta);
 
         retrieveCMLDevice(wmmaResult, d_c);
 
-        if (display)
-        {
-            std::cout << "WMMA Result: " << std::endl;
-            printMatrix(wmmaResult);
-        }
+        // // if (display)
+        // // {
+        // //     std::cout << "WMMA Result: " << std::endl;
+        // //     printMatrix(wmmaResult);
+        // // }
     }
 
     // Cublas 
     {
         cublasLtHandle_t ltHandle;
         checkCublasStatus(cublasLtCreate(&ltHandle));
-        // AccumulatorType cublasResult[M * N];
+        AccumulatorType cublasResult[M][N];
         // //LtIgemmTensor<MatrixType,AccumulatorType,M,N,K>(ltHandle,M,N,K,a,M,b,K,cublasResult,M);
         
-        const AccumulatorType alpha {1.f};
-        const AccumulatorType beta {0.f};
         void *workspace;
         size_t workspaceSize = 1024 * 1024 * 4;
         checkCudaStatus(cudaMalloc((void **)&workspace, workspaceSize));
@@ -372,42 +388,31 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         checkCudaStatus(cudaFree(workspace));
         
         retrieveCMLDevice(cublasResult, d_c);
-        if (display)
-        {   
-            std::cout << "CuBLAS Result: " << std::endl;
-            printMatrix(cublasResult);
-        } 
+        // if (display)
+        // {   
+        //     std::cout << "CuBLAS Result: " << std::endl;
+        //     printMatrix(cublasResult);
+        // } 
     }
 
-    AccumulatorType residualMatrix[M][N];
-    auto& result = wmmaResult;
     bool passed = true;
 
     for(int i = 0; i < M; i++)
+    {
         for (int j = 0; j < N; j++)
         {
-            residualMatrix[i][j] = (AccumulatorType) nonTensorResult[i][j] - result[i][j];
-            if (residualMatrix[i][j] != 0) passed = false;
+            if ((cublasResult[i][j] - wmmaResult[i][j]) > (AccumulatorType) 0) 
+            {
+                passed = false;
+                if (display) std::cout << "1 ";
+            }
+            if (display) std::cout << "0 ";
         }
+        if (display) std::cout << std::endl;
+    }
 
     std::cout << "PASSED: " << passed << std::endl; 
 
-    if (display)
-    {
-        for(int i = 0; i < M; i++)
-        {
-            for (int j = 0; j < N; j++)
-            {
-                if (residualMatrix[i][j] != 0) 
-                    //std::cout << i << "," << j << ": " << residualMatrix[i][j] << std::endl;
-                    std::cout << "1 ";
-                else
-                    std::cout << "0 ";
-
-            }
-            std::cout << std::endl;
-        }
-    }
     // Deallocate device memory
     checkCudaStatus(cudaFree(d_a));
     checkCudaStatus(cudaFree(d_b));

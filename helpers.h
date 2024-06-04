@@ -1,7 +1,9 @@
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <iomanip>
+#include <mma.h>
 #include <sstream>
 
 #define IDX2C(i,j,ld) (((j)*(ld))+(i))  // Operator to convert: Column Mayor Layout INDEXING -> Row Mayor Storage
@@ -45,8 +47,8 @@ inline void checkCublasStatus(cublasStatus_t status) {
 }
 
 template<typename T, std::size_t M, std::size_t N>
-T* allocateCMLDevice(const T(&a)[M][N])
-{
+inline T* allocateCMLDevice(const T(&a)[M][N])
+{ 
     T temp[M * N], *d;
     checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
     for (int i{0}; i < M; ++i)
@@ -113,3 +115,46 @@ struct cudaType<float> {static const cudaDataType_t type = CUDA_R_32F;};
 
 template<>
 struct cudaType<double> {static const cudaDataType_t type = CUDA_R_64F;};
+
+template<typename MatrixType, typename AccumulatorType>
+struct wmmaTileSize {};
+
+template<>
+struct wmmaTileSize<half,float> 
+{
+    static const size_t M = 16;
+    static const size_t N = 16;
+    static const size_t K = 16;
+};
+
+template<>
+struct wmmaTileSize<half,half> 
+{
+    static const size_t M = 16;
+    static const size_t N = 16;
+    static const size_t K = 16;
+};
+
+template<>
+struct wmmaTileSize<__nv_bfloat16,float> 
+{
+    static const size_t M = 16;
+    static const size_t N = 16;
+    static const size_t K = 16;
+};
+
+// template<>
+// struct wmmaTileSize<nvcuda::wmma::precision::tf32,float> 
+// {
+//     static const size_t M = 16;
+//     static const size_t N = 16;
+//     static const size_t K = 8;
+// };
+
+template<>
+struct wmmaTileSize<double,double> 
+{
+    static const size_t M = 8;
+    static const size_t N = 8;
+    static const size_t K = 4;
+};
