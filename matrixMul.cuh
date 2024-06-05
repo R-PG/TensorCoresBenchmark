@@ -11,8 +11,12 @@
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 struct MatrixMul
 {
-    MatrixType a[M][K];
-    MatrixType b[K][N];
+    using ResultType = typename hostResultType<MatrixType,AccumulatorType>::type;
+
+    MatrixType **a = allocate2DArray<MatrixType>(M,K);
+    MatrixType **b = allocate2DArray<MatrixType>(K,N);
+    ResultType **wmmaResult = allocate2DArray<ResultType>(M,N);
+    ResultType **cublasResult = allocate2DArray<ResultType>(M,N);
 
     // WMMA dimensions
     static const size_t WMMA_M = wmmaTileSize<MatrixType,AccumulatorType>::M;
@@ -20,28 +24,39 @@ struct MatrixMul
     static const size_t WMMA_K = wmmaTileSize<MatrixType,AccumulatorType>::K;
 
     MatrixMul();
+    ~MatrixMul();
 
     void runTest(bool display = false);
 };
 
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
-MatrixMul<MatrixType,AccumulatorType,M,N,K>::MatrixMul(){    
+MatrixMul<MatrixType,AccumulatorType,M,N,K>::MatrixMul()
+{    
     std::random_device rd;  // Will be used to obtain a seed for the random number engine
     std::mt19937 gen(rd()); // Standard mersenne_twister_engine seeded with rd()
     //std::uniform_real_distribution<> dis(std::numeric_limits<MatrixType>::min(), std::numeric_limits<MatrixType>::max());
     std::uniform_real_distribution<> dis(0, 9);
 
-    for (int i{0}; i < M; i++)
-        for (int j{0}; j < K; j++)
+    for (int i{0}; i < K; i++)
+        for (int j{0}; j < M; j++)
             {
                 a[i][j] = (MatrixType) dis(gen);
             }
-    for (int i{0}; i < K; i++)
-        for (int j{0}; j < N; j++)
+    for (int i{0}; i < N; i++)
+        for (int j{0}; j < K; j++)
             {
                 b[i][j] = (MatrixType) dis(gen);
             }
 };
+
+template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
+MatrixMul<MatrixType,AccumulatorType,M,N,K>::~MatrixMul()
+{
+    deallocate2DArray<MatrixType>(a,K);
+    deallocate2DArray<MatrixType>(b,N);
+    deallocate2DArray<ResultType>(wmmaResult,N);
+    deallocate2DArray<ResultType>(cublasResult,N);
+}
 
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 __global__ void matrixMultiplicationKernel(MatrixType* A, MatrixType* B, AccumulatorType* C) // A way to adapt the type of teh regular operation to the type of the matrix operation?????? 
@@ -331,19 +346,19 @@ void LtSgemm(cublasLtHandle_t ltHandle,
 template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
 void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
     MatrixType *d_a = NULL, *d_b = NULL;
-    AccumulatorType *d_c = NULL, wmmaResult[M][N], cublasResult[M][N], alpha {1}, beta {0};
+    AccumulatorType *d_c = NULL, alpha {1}, beta {0};
 
-    // if (display)
-    // {
-    //     std::cout << "Matrix A: " << std::endl;
-    //     printMatrix(a);
-    //     std::cout << "Matrix B: " << std::endl;
-    //     printMatrix(b);
-    // }
+    if (display)
+    {
+        std::cout << "Matrix A: " << std::endl;
+        printMatrix<MatrixType>(a, M, K);
+        std::cout << "Matrix B: " << std::endl;
+        printMatrix<MatrixType>(b, K, N);
+    }
 
-    d_a = allocateCMLDevice(a);
-    d_b = allocateCMLDevice(b);
-    d_c = allocateCMLDevice<AccumulatorType,M,N>();
+    d_a = allocateDevice<MatrixType>(a, M, K);
+    d_b = allocateDevice<MatrixType>(a, K, N);
+    d_c = allocateDevice<AccumulatorType>(M, N);
 
     // WMMA
     {
@@ -352,8 +367,10 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         dim3 gridDim;
         dim3 blockDim;
 
-        // blockDim.x must be a multple of warpSize
-        // 128x4 means we have 16 warps and a block computes a 64x64 output tile
+        /*
+         blockDim.x must be a multple of warpSize
+         128x4 means we have 16 warps and a block computes a 64x64 output tile
+        */
         blockDim.x = 128;
         blockDim.y = 4;
 
@@ -363,50 +380,51 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         wmma_ker<MatrixType,AccumulatorType,M,N,K,WMMA_M,WMMA_N,WMMA_K>
         <<<gridDim,blockDim>>>(d_a, d_b, d_c, alpha, beta);
 
-        retrieveCMLDevice(wmmaResult, d_c);
+        retrieveDevice<ResultType>(wmmaResult, d_c, M, N);
 
-        // // if (display)
-        // // {
-        // //     std::cout << "WMMA Result: " << std::endl;
-        // //     printMatrix(wmmaResult);
-        // // }
+        if (display)
+        {
+            std::cout << "WMMA Result: " << std::endl;
+            printMatrix<ResultType>(wmmaResult, M, N);
+        }
     }
 
     // Cublas 
     {
         cublasLtHandle_t ltHandle;
         checkCublasStatus(cublasLtCreate(&ltHandle));
-        AccumulatorType cublasResult[M][N];
-        // //LtIgemmTensor<MatrixType,AccumulatorType,M,N,K>(ltHandle,M,N,K,a,M,b,K,cublasResult,M);
         
         void *workspace;
         size_t workspaceSize = 1024 * 1024 * 4;
         checkCudaStatus(cudaMalloc((void **)&workspace, workspaceSize));
+        
         checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
 
         LtSgemm<AccumulatorType,MatrixType,AccumulatorType>(ltHandle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &alpha, d_a, M, d_b, K, &beta, d_c, M, workspace, workspaceSize);
+        
         checkCudaStatus(cudaFree(workspace));
         
-        retrieveCMLDevice(cublasResult, d_c);
-        // if (display)
-        // {   
-        //     std::cout << "CuBLAS Result: " << std::endl;
-        //     printMatrix(cublasResult);
-        // } 
+        retrieveDevice<ResultType>(cublasResult, d_c, M, N);
+
+        if (display)
+        {   
+            std::cout << "CuBLAS Result: " << std::endl;
+            printMatrix<ResultType>(cublasResult, M, N);
+        } 
     }
 
     bool passed = true;
 
-    for(int i = 0; i < M; i++)
+
+    for(int i = 0; i < N; i++)
     {
-        for (int j = 0; j < N; j++)
+        for (int j = 0; j < M; j++)
         {
-            if ((cublasResult[i][j] - wmmaResult[i][j]) > (AccumulatorType) 0) 
+            if (cublasResult[i][j] != wmmaResult[i][j]) 
             {
                 passed = false;
-                if (display) std::cout << "1 ";
             }
-            if (display) std::cout << "0 ";
+            if (display) std::cout << (cublasResult[i][j] != wmmaResult[i][j]);
         }
         if (display) std::cout << std::endl;
     }

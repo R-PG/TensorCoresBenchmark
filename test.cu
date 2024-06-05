@@ -1,21 +1,21 @@
 #include "matrixMul.cuh"
-#define SEED 31
 
 int main(){
-    const size_t M = 64;
-    const size_t N = 64;
-    const size_t K = 64;
+
+    const size_t M = 16384;
+    const size_t N = 16384;
+    const size_t K = 16384;
     
     {
-        MatrixMul<half,float,M,N,K> test1;
-        std::cout << "Half: " << M << "x" << N << "x" << K << " :Float" << std::endl;
+        MatrixMul<half,half,M,N,K> test1;
+        std::cout << "Half: " << M << "x" << N << "x" << K << " :Half" << std::endl;
         test1.runTest();
     }
 
     {
-        MatrixMul<half,half,M,N,K> test2;
-        std::cout << "Half: " << M << "x" << N << "x" << K << " :Half" << std::endl;
-        test2.runTest(true);
+        MatrixMul<half,float,M,N,K> test2;
+        std::cout << "Half: " << M << "x" << N << "x" << K << " :Float" << std::endl;
+        test2.runTest();
     }
 
     {

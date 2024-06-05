@@ -1,4 +1,5 @@
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <iostream>
@@ -6,7 +7,30 @@
 #include <mma.h>
 #include <sstream>
 
-#define IDX2C(i,j,ld) (((j)*(ld))+(i))  // Operator to convert: Column Mayor Layout INDEXING -> Row Mayor Storage
+template <typename T>
+T** allocate2DArray(size_t rows, size_t cols) {
+    // Allocate memory for an array of pointers (each pointing to a col)
+    T** array = new T*[cols];
+
+    // Allocate a single block of memory for all the elements
+    T* data = new T[rows * cols];
+
+    // Set the row pointers to point to the appropriate positions in the block
+    for (int i = 0; i < cols; ++i) {
+        array[i] = data + i * rows;
+    }
+
+    return array;
+}
+
+template <typename T>
+void deallocate2DArray(T** array, size_t cols) {
+    // Deallocate the block of memory containing all the elements
+    delete[] array[0];
+
+    // Deallocate the array of pointers
+    delete[] array;
+}
 
 std::ostream& operator<<(std::ostream& os, const half& value) {
     os << static_cast<float>(value); // Assuming half is convertible to float
@@ -18,12 +42,12 @@ std::ostream& operator<<(std::ostream& os, const int8_t& value) {
     return os;
 }
 
-template<typename T, std::size_t M, std::size_t N>
-void printMatrix(const T(&a)[M][N])
+template<typename T>
+void printMatrix(T **a, std::size_t M, std::size_t N)
 {
-    for(std::size_t i = 0; i < M; ++i)
+    for(std::size_t i = 0; i < N; ++i)
     {
-        for(std::size_t j = 0; j < N; ++j)
+        for(std::size_t j = 0; j < M; ++j)
         {
             std::cout << std::setw(10) << std::fixed << std::setprecision(10) << a[i][j] << " ";
         }
@@ -46,32 +70,17 @@ inline void checkCublasStatus(cublasStatus_t status) {
     }
 }
 
-template<typename T, std::size_t M, std::size_t N>
-inline T* allocateCMLDevice(const T(&a)[M][N])
-{ 
-    T temp[M * N], *d;
-    checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
-    for (int i{0}; i < M; ++i)
-        for (int j{0}; j < N; ++j)
-            temp[IDX2C(i,j,M)] = a[i][j];
-    checkCudaStatus(cudaMemcpy(d, temp, sizeof(T) * M * N, cudaMemcpyHostToDevice));
-    return d;
-}
-
-template<typename T, std::size_t M, std::size_t N>
-T* allocateRMLDevice(const T(&a)[M][N])
+template<typename T>
+T* allocateDevice(T **a, std::size_t M, std::size_t N)
 {
-    T temp[M * N], *d;
+    T *d;
     checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
-    for (int i{0}; i < M; ++i)
-        for (int j{0}; j < N; ++j)
-            temp[i * M + j] = a[i][j];
-    checkCudaStatus(cudaMemcpy(d, temp, sizeof(T) * M * N, cudaMemcpyHostToDevice));
+    checkCudaStatus(cudaMemcpy(d, a[0], sizeof(T) * M * N, cudaMemcpyHostToDevice));
     return d;
 }
 
-template<typename T, std::size_t M, std::size_t N>
-T* allocateCMLDevice()
+template<typename T>
+T* allocateDevice(std::size_t M, std::size_t N)
 {
     T* d;
     checkCudaStatus(cudaMalloc((void **)&d, sizeof(T) * M * N));
@@ -79,15 +88,37 @@ T* allocateCMLDevice()
     return d;
 }
 
-template<typename T, std::size_t M, std::size_t N>
-void retrieveCMLDevice(T(&a)[M][N], T* d)
+// template<typename T = float>
+// void retrieveDevice(float **a, half* d, std::size_t M, std::size_t N)
+// {
+//     half **temp = allocate2DArray<half>(M,N);
+//     checkCudaStatus(cudaMemcpy(temp, d, sizeof(half) * M * N, cudaMemcpyDeviceToHost));
+//     for (int i{0}; i < N; ++i)
+//         for (int j{0}; j < M; ++j)
+//             a[i][j] = __half2float(temp[i][j]);
+//     deallocate2DArray<half>(temp,M);
+// }
+
+template<typename T>
+void retrieveDevice(T **a, T* d, std::size_t M, std::size_t N)
 {
-    T temp[M * N];
-    checkCudaStatus(cudaMemcpy(temp, d, sizeof(T) * M * N, cudaMemcpyDeviceToHost));
-    for (int i{0}; i < M; ++i)
-        for (int j{0}; j < N; ++j)
-            a[i][j] = temp[j * M + i];
+    checkCudaStatus(cudaMemcpy(a[0], d, sizeof(T) * M * N, cudaMemcpyDeviceToHost));
 }
+
+/*
+    Get comparator type
+*/
+template<typename MatrixType, typename AccumulatorType>
+struct hostResultType {};
+
+template<>
+struct hostResultType<half,half> {using type = half;};
+
+template<>
+struct hostResultType<half,float> {using type = float;};
+
+template<>
+struct hostResultType<double,double> {using type = double;};
 
 /*
     Get compile time compute type based on the Scale Type and Atype/Btype 
@@ -118,6 +149,10 @@ struct cudaType<double> {static const cudaDataType_t type = CUDA_R_64F;};
 
 template<typename MatrixType, typename AccumulatorType>
 struct wmmaTileSize {};
+
+/*
+    Get tile sizes
+*/
 
 template<>
 struct wmmaTileSize<half,float> 
