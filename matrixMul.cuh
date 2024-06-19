@@ -8,13 +8,14 @@
 #ifndef MATRIXMUL_CUH
 #define MATRIXMUL_CUH
 
-template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
+template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N = M, std::size_t K = M>
 struct MatrixMul
 {
     using ResultType = typename hostResultType<MatrixType,AccumulatorType>::type;
 
     MatrixType **a = allocate2DArray<MatrixType>(M,K);
     MatrixType **b = allocate2DArray<MatrixType>(K,N);
+    ResultType **naiveResult = allocate2DArray<ResultType>(M,N);
     ResultType **wmmaResult = allocate2DArray<ResultType>(M,N);
     ResultType **cublasResult = allocate2DArray<ResultType>(M,N);
 
@@ -54,6 +55,7 @@ MatrixMul<MatrixType,AccumulatorType,M,N,K>::~MatrixMul()
 {
     deallocate2DArray<MatrixType>(a,K);
     deallocate2DArray<MatrixType>(b,N);
+    deallocate2DArray<ResultType>(naiveResult,N);
     deallocate2DArray<ResultType>(wmmaResult,N);
     deallocate2DArray<ResultType>(cublasResult,N);
 }
@@ -74,6 +76,30 @@ __global__ void matrixMultiplicationKernel(MatrixType* A, MatrixType* B, Accumul
         C[col * M + row] = (AccumulatorType) sum;
     //}
     // COLUMN MAYOR LAYOUT
+}
+
+// Kernel definition for matrix multiplication
+template <typename T>
+__global__ void matrixMultiplyKernel(const T* A, const T* B, T* C, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < n && col < n) {
+        T value = 0;
+        for (int k = 0; k < n; ++k) {
+            value += A[row * n + k] * B[k * n + col];
+        }
+        C[row * n + col] = value;
+    }
+}
+
+// Host function to set up and call the kernel
+template <typename T>
+void matrixMultiply(const T* A, const T* B, T* C, int n) {
+    dim3 threadsPerBlock(16, 16);
+    dim3 blocksPerGrid((n + 15) / 16, (n + 15) / 16);
+
+    matrixMultiplyKernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, n);
 }
 
 // Performs an MxNxK GEMM (C=alpha*A*B + beta*C) assuming:
@@ -139,127 +165,6 @@ AccumulatorType beta)
       // Store the output
       nvcuda::wmma::store_matrix_sync(c + cRow + cCol * ldc, c_frag, ldc, nvcuda::wmma::mem_col_major);
    }
-}
-
-int roundoff(int v, int d) {
-    return (v + d - 1) / d * d;
-}
-
-/// Use cublasLtMatmul to perform tensor-op Igemm with memory order transforms on all buffers
-///int8_t
-/// For better performance data order transforms should be offline as much as possible.
-///
-/// transa, transb assumed N; alpha, beta are host pointers, tensor ops allowed, alpha assumed 1, beta assumed 0,
-/// stream assumed 0
-template<typename MatrixType, typename AccumulatorType, std::size_t M, std::size_t N, std::size_t K>
-void LtIgemmTensor(cublasLtHandle_t ltHandle,
-                   int m,
-                   int n,
-                   int k,
-                   const MatrixType *A,
-                   int lda,
-                   const MatrixType *B,
-                   int ldb,
-                   AccumulatorType *C,
-                   int ldc) {
-    cublasLtMatmulDesc_t matmulDesc = NULL;
-    cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
-    int32_t alpha = 1, beta = 0;
-    cublasOperation_t opTranspose = CUBLAS_OP_T;
-
-    // tensor op igemm kernels require specialized memory order of data
-    cublasLtMatrixTransformDesc_t transformDesc = NULL;
-    int8_t *Atransform = NULL, *Btransform = NULL;
-    int32_t *Ctransform                   = NULL;
-    cublasLtMatrixLayout_t AtransformDesc = NULL, BtransformDesc = NULL, CtransformDesc = NULL;
-    float transformAlpha = 1.0f, transformBeta = 0.0f;
-    cublasLtOrder_t order_COL32       = CUBLASLT_ORDER_COL32;
-    cublasLtOrder_t order_COL4_4R2_8C = CUBLASLT_ORDER_COL4_4R2_8C;
-
-    int ldatransform = 32 * m;
-    int ldbtransform = 32 * roundoff(n, 8);
-    int ldctransform = 32 * m;
-
-    checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Atransform), sizeof(int8_t) * roundoff(k, 32) / 32 * ldatransform));
-    checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Btransform), sizeof(int8_t) * roundoff(k, 32) / 32 * ldbtransform));
-    checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Ctransform), sizeof(int32_t) * roundoff(n, 32) / 32 * ldctransform));
-
-    checkCublasStatus(cublasLtMatrixTransformDescCreate(&transformDesc, CUDA_R_32F));
-
-    checkCublasStatus(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    // tensor op igemm kernels only support NT gemm
-    checkCublasStatus(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opTranspose, sizeof(opTranspose)));
-
-    // ---------------------------------------------------------------------------------------------
-    // create descriptors for original matrices
-
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, m, k, lda));
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, k, n, ldb));
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, m, n, ldc));
-
-    // ---------------------------------------------------------------------------------------------
-    // create descriptors for transformed matrices
-
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&AtransformDesc, CUDA_R_8I, m, k, ldatransform));
-    checkCublasStatus(cublasLtMatrixLayoutSetAttribute(AtransformDesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_COL32, sizeof(order_COL32)));
-
-    // data memory order is set to CUBLASLT_ORDER_COL4_4R2_8C in order to achieve best performance on Turing devices.
-    // for best performance on Ampere, consider setting the memory order to CUBLASLT_ORDER_COL32_2R_4R4.
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&BtransformDesc, CUDA_R_8I, n, k, ldbtransform));
-    checkCublasStatus(cublasLtMatrixLayoutSetAttribute(BtransformDesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_COL4_4R2_8C, sizeof(order_COL4_4R2_8C)));
-
-    checkCublasStatus(cublasLtMatrixLayoutCreate(&CtransformDesc, CUDA_R_32I, m, n, ldctransform));
-    checkCublasStatus(cublasLtMatrixLayoutSetAttribute(CtransformDesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_COL32, sizeof(order_COL32)));
-
-    // ---------------------------------------------------------------------------------------------
-    // transforms and computation
-
-    checkCublasStatus(cublasLtMatrixTransform(ltHandle, transformDesc, &transformAlpha, A, Adesc, &transformBeta, NULL, NULL, Atransform, AtransformDesc, 0));
-
-    // B matrix is non-transposed, but transposed matrix is needed - add transpose operation in matrix transform.
-    checkCublasStatus(cublasLtMatrixTransformDescSetAttribute(transformDesc, CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-
-    checkCublasStatus(cublasLtMatrixTransform(ltHandle, transformDesc, &transformAlpha, B, Bdesc, &transformBeta, NULL, NULL, Btransform, BtransformDesc, 0));
-
-    // no need to transform C matrix as beta is assumed to be 0
-    checkCublasStatus(cublasLtMatmul(ltHandle,
-                                     matmulDesc,
-                                     &alpha,
-                                     Atransform,
-                                     AtransformDesc,
-                                     Btransform,
-                                     BtransformDesc,
-                                     &beta,
-                                     Ctransform,
-                                     CtransformDesc,
-                                     Ctransform,
-                                     CtransformDesc,
-                                     NULL,
-                                     NULL,
-                                     0,
-                                     0));
-
-    opTranspose = CUBLAS_OP_N;
-    checkCublasStatus(cublasLtMatrixTransformDescSetAttribute(transformDesc, CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSA, &opTranspose, sizeof(opTranspose)));
-
-    // transform outputs to COL order
-    checkCublasStatus(cublasLtMatrixTransform(ltHandle, transformDesc, &transformAlpha, Ctransform, CtransformDesc, &transformBeta, NULL, NULL, C, Cdesc, 0));
-
-    // descriptors are no longer needed as all GPU work was already enqueued
-    if (CtransformDesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(CtransformDesc));
-    if (BtransformDesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(BtransformDesc));
-    if (AtransformDesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(AtransformDesc));
-    if (Cdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Cdesc));
-    if (Bdesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Bdesc));
-    if (Adesc) checkCublasStatus(cublasLtMatrixLayoutDestroy(Adesc));
-    if (matmulDesc) checkCublasStatus(cublasLtMatmulDescDestroy(matmulDesc));
-    if (transformDesc) checkCublasStatus(cublasLtMatrixTransformDescDestroy(transformDesc));
-
-    // wait until device is done before freeing transformed buffers
-    checkCudaStatus(cudaDeviceSynchronize());
-    if (Ctransform) checkCudaStatus(cudaFree(Ctransform));
-    if (Btransform) checkCudaStatus(cudaFree(Btransform));
-    if (Atransform) checkCudaStatus(cudaFree(Atransform));
 }
 
 /// Sample wrapper executing single precision gemm with cublasLtMatmul, nearly a drop-in replacement for cublasSgemm,
@@ -360,6 +265,13 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
     d_b = allocateDevice<MatrixType>(a, K, N);
     d_c = allocateDevice<AccumulatorType>(M, N);
 
+    // Naive
+    {
+        matrixMultiply(d_a,d_b,d_c,M);
+        retrieveDevice<ResultType>(naiveResult, d_c, M, N);
+        
+    }
+
     // WMMA
     {
         checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
@@ -395,7 +307,7 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
         checkCublasStatus(cublasLtCreate(&ltHandle));
         
         void *workspace;
-        size_t workspaceSize = 1024 * 1024 * 4;
+        size_t workspaceSize = M * N * 4;
         checkCudaStatus(cudaMalloc((void **)&workspace, workspaceSize));
         
         checkCudaStatus(cudaMemset(d_c, 0, M * N * sizeof(AccumulatorType)));
@@ -420,7 +332,7 @@ void MatrixMul<MatrixType,AccumulatorType,M,N,K>::runTest(bool display) {
     {
         for (int j = 0; j < M; j++)
         {
-            if (cublasResult[i][j] != wmmaResult[i][j]) 
+            if (naiveResult[i][j] != wmmaResult[i][j] || wmmaResult[i][j] != cublasResult[i][j]) 
             {
                 passed = false;
             }
