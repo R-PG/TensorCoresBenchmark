@@ -47,11 +47,11 @@ int main()
                 println("\t\t\033[31mCuBlas and WMMA results differ\033[0m");
             else
                 println("\t\t\033[32mCuBlas and WMMA results are identic\033[0m");
-
+            
             if (elemWiseEqual(naive, cublas))
-                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
-            else
                 println("\t\t\033[32mNaive and cuBLAS results are identic\033[0m");
+            else
+                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
         }
     }
 
@@ -76,9 +76,9 @@ int main()
                 println("\t\t\033[32mCuBlas and WMMA results are identic\033[0m");
 
             if (elemWiseEqual(naive, cublas))
-                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
-            else
                 println("\t\t\033[32mNaive and cuBLAS results are identic\033[0m");
+            else
+                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
         }
     }
 
@@ -103,9 +103,9 @@ int main()
             //     println("\t\t\033[32mCuBlas and WMMA results are identic\033[0m");
 
             if (elemWiseEqual(naive, cublas))
-                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
-            else
                 println("\t\t\033[32mNaive and cuBLAS results are identic\033[0m");
+            else
+                println("\t\t\033[31mNavie and cuBLAS results differ\033[0m");
         }
     }
      
