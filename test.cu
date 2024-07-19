@@ -1,54 +1,22 @@
-#include "matrixMul.cuh"
+#include "helpers.cuh"
 
 int main(){
-    using MatrixType = half;
-    using AccumulatorType = half;
 
-    if constexpr(0)
-    {
-        {
-            const size_t N = 256;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-        
-        {
-            const size_t N = 512;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-
-        {
-            const size_t N = 1024;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-
-        {
-            const size_t N = 2048;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }   
-
-        {
-            const size_t N = 4096;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-    }
-
-    if constexpr(1)
-    {
-        {
-            const size_t N = 8192;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-
-        {
-            const size_t N = 16384;
-            MatrixMul<MatrixType,AccumulatorType,N> test;
-            test.runTest();
-        }
-    }
+    Matrix_2D<half> a(16,16);
+    a.fillRandom();
+    Matrix_2D<half> b(16,16);
+    b.fillRandom();
+    auto naive  = matrixMulNaive(a,b);
+    auto wmma  = matrixMulWMMA<half,half>(a,b);
+    auto cublas  = matrixMulCuBLAS<CUBLAS_COMPUTE_16F,half,half>(a,b);
+    a.print();
+    std::cout << std::endl;
+    b.print();
+    std::cout << std::endl;
+    naive.print();
+    std::cout << std::endl;
+    wmma.print();
+    std::cout << std::endl;
+    cublas.print();
+    std::cout << std::endl;
 }
