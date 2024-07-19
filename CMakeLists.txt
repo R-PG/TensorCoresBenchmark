@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Specify the source files
-set(SOURCES kernels.cu helpers.cu test.cu)
+set(SOURCES test.cu)
 
 # Add the executable
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -20,7 +20,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 # You can add more specific flags like this:
 target_compile_options(${PROJECT_NAME} PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-g -rdc=true -gencode arch=compute_86,code=sm_86>
+    $<$<COMPILE_LANGUAGE:CUDA>:-g -gencode arch=compute_86,code=sm_86>
 )
 
 set(CUDART_LIBRARY cudart)

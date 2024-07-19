@@ -195,7 +195,7 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
         nvcuda::wmma::load_matrix_sync(cFrag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
     
     // #pragma unroll
-    // for(int i=0; i < cFrag.num_elements; i++) {
+    // for(int i=0; i < cFrag.num_elements; ++i) {
     //     cFrag.x[i] = accFrag.x[i] + cFrag.x[i];
     // }
 
@@ -203,7 +203,7 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
       nvcuda::wmma::load_matrix_sync(cFrag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
 
 #pragma unroll
-      for(int i{0}; i < cFrag.num_elements; i++)
+      for(int i{0}; i < cFrag.num_elements; ++i)
          cFrag.x[i] = alpha * accFrag.x[i] + beta * cFrag.x[i];
 
     // Store the output
