@@ -60,6 +60,10 @@
         "semaphore": "cpp",
         "stop_token": "cpp",
         "thread": "cpp",
-        "__nullptr": "cpp"
+        "__nullptr": "cpp",
+        "set": "cpp",
+        "shared_mutex": "cpp",
+        "cfenv": "cpp",
+        "target": "cpp"
     }
 }

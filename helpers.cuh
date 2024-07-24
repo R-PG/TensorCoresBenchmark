@@ -6,7 +6,7 @@
 #include <iomanip>
 #include <functional>
 #include "kernels.cuh"
-#include <memory.h>
+#include <memory>
 #include <random>
 #include <sstream>
 
@@ -107,7 +107,9 @@ template <typename T>
 template<typename R>
 bool Matrix_2D<T>::operator==(const Matrix_2D<R>& other) const 
 {
-    return std::memcmp(_data.get(),other._data.get(),_rows * _cols * std::min(sizeof(T),sizeof(R)));
+    return (_cols != other._cols || _rows != other._rows) ? 
+        false :
+        !std::memcmp(_data.get(),other._data.get(),_rows * _cols * std::min(sizeof(T),sizeof(R)));
 }
 
 template <typename T>
@@ -137,15 +139,12 @@ half double2Type(double item) {return __double2half(item);}
 template <>
 __nv_bfloat16 double2Type(double item) {return __double2bfloat16(item);}
 
-// template <>
-// nvcuda::wmma::precision::tf32 double2Type(double item) {return __float_to_tf32(item);}
-
 template <typename T>
 void Matrix_2D<T>::fillRandom()
 {
     std::random_device rd;  // Will be used to obtain a seed for the random number engine
     std::mt19937 gen(rd()); // Standard mersenne_twister_engine seeded with rd()
-    std::uniform_real_distribution<> dis(0, 10);
+    std::uniform_real_distribution<> dis(0, 1);
 
     for (int i{0}; i < _cols; ++i)
         for (int j{0}; j < _rows; ++j)
@@ -207,6 +206,23 @@ bool elemWiseEqual(const Matrix_2D<T>& a, const Matrix_2D<R>& b)
         for (int j{0}; j < a._rows; ++j)
             if (a.elem(i,j) - ((T) b.elem(i,j)) > (T) 0) return false;
     return true;
+}
+
+template <typename T, typename R>
+double subs(T a, R b) {return type2Double(a) - type2Double(b);} 
+
+template<typename T, typename R>
+double maxEps(const Matrix_2D<R>& a, const Matrix_2D<T>& b)
+{
+    double maxEps = 0;
+    if (a._cols != b._cols || a._rows != b._rows) return -1;
+    for (int i{0}; i < a._cols; ++i)
+        for (int j{0}; j < a._rows; ++j)
+        {
+            double eps = std::abs(subs(a.elem(i,j),b.elem(i,j)));
+            maxEps = std::fmax(maxEps,eps);
+        }
+    return maxEps;
 }
 
 void println(const char* str) {std::cout << str << std::endl;}

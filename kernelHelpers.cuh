@@ -33,13 +33,13 @@ struct wmmaTileSize<nv_bfloat16>
     static const size_t K = 16;
 };
 
-// template<>
-// struct wmmaTileSize<nvcuda::wmma::precision::tf32> 
-// {
-//     static const size_t M = 16;
-//     static const size_t N = 16;
-//     static const size_t K = 8;
-// };
+template<>
+struct wmmaTileSize<nvcuda::wmma::precision::tf32> 
+{
+    static const size_t M = 16;
+    static const size_t N = 16;
+    static const size_t K = 8;
+};
 
 template<>
 struct wmmaTileSize<double> 

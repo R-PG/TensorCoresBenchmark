@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 # Set the project name and enable CUDA
-project(test LANGUAGES CXX CUDA)
+project(tensorCoreBenchmark LANGUAGES CXX CUDA)
 
 # Specify the minimum required C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Specify the source files
-set(SOURCES test.cu)
+set(SOURCES tensorCoreBenchmark.cu)
 
 # Add the executable
 add_executable(${PROJECT_NAME} ${SOURCES})

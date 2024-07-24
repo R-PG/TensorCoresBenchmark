@@ -15,6 +15,10 @@
 /*               INTERFACE               */
 //=========================================
 
+/*
+    All The matrices are considered to be in COLUMN MAJOR STORAGE
+*/
+
 inline void checkCudaStatus(cudaError_t status);
 
 inline void checkCublasStatus(cublasStatus_t status);
@@ -25,7 +29,7 @@ T* allocateDevice(std::size_t size, T *data = nullptr);
 template<typename T>
 void retrieveDevice(std::size_t size, T *data, T *devicePtr);
 
-// Kernel definition for naive matrix multiplication column major layout
+// Kernel definition for naive matrix multiplication
 template <typename T>
 __global__ void naiveMatrixMultiplyKernel(const T *a, const T *b, T *c, std::size_t m, std::size_t n ,std::size_t k);
 
@@ -117,7 +121,8 @@ __global__ void naiveMatrixMultiplyKernel(const T *a, const T *b, T *c, std::siz
         T acc{0};
         // Each thread computes one element of the block sub-matrix
         for (int i = 0; i < n; ++i) {
-            acc += a[row + i * m] * b[i + col * n];
+            //acc = __hfma_relu(a[row + i * m],b[i + col * n],acc);
+            acc = a[row + i * m] * b[i + col * n] + acc;
         }
         c[row + col * m] = acc;
     }
@@ -164,7 +169,7 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, AccumulatorType> accFrag;
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, AccumulatorType> cFrag;
 
-    nvcuda::wmma::fill_fragment(accFrag, 0.0f);
+    nvcuda::wmma::fill_fragment(accFrag, (AccumulatorType)0);
 
     // Loop over k
     for (int i = 0; i < k; i += WMMA_K) {
@@ -175,7 +180,7 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
         int bCol = warpN * WMMA_N;
 
         // Bounds checking
-        if (aRow < m && aCol < k && bRow < k && bCol < n) 
+        if (aRow < m && aCol < k && bRow < k && bCol < n)
         {
             // Load the inputs
             nvcuda::wmma::load_matrix_sync(aFrag, a + aRow + aCol * lda, lda);
@@ -183,7 +188,6 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
 
             // Perform the matrix multiplication
             nvcuda::wmma::mma_sync(accFrag, aFrag, bFrag, accFrag);
-
         }
     }
 
@@ -192,22 +196,17 @@ __global__ void wmmaKernel(const ABType *a, const ABType *b, AccumulatorType *c,
     int cCol = warpN * WMMA_N;
 
     if (cRow < m && cCol < n)
-        nvcuda::wmma::load_matrix_sync(cFrag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
-    
+    {
+        //nvcuda::wmma::load_matrix_sync(cFrag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
+
     // #pragma unroll
-    // for(int i=0; i < cFrag.num_elements; ++i) {
-    //     cFrag.x[i] = accFrag.x[i] + cFrag.x[i];
-    // }
+        //for(int i{0}; i < cFrag.num_elements; ++i)
+            //cFrag.x[i] = alpha * accFrag.x[i] + beta * cFrag.x[i];
 
-    if (cRow < m && cCol < n)
-      nvcuda::wmma::load_matrix_sync(cFrag, c + cRow + cCol * ldc, ldc, nvcuda::wmma::mem_col_major);
-
-#pragma unroll
-      for(int i{0}; i < cFrag.num_elements; ++i)
-         cFrag.x[i] = alpha * accFrag.x[i] + beta * cFrag.x[i];
-
-    // Store the output
-    nvcuda::wmma::store_matrix_sync(c + cRow + cCol * ldc, accFrag, ldc, nvcuda::wmma::mem_col_major);
+        // Store the output
+        //nvcuda::wmma::store_matrix_sync(c + cRow + cCol * ldc, accFrag, ldc, nvcuda::wmma::mem_col_major);
+        nvcuda::wmma::store_matrix_sync(c + cRow + cCol * ldc, accFrag, ldc, nvcuda::wmma::mem_col_major);
+    }
 }
 
 template<typename ABType, typename AccumulatorType>
@@ -327,6 +326,12 @@ void cublasMatrixMultiply(const ABType *a, const ABType *b, AccumulatorType *c, 
 
     LtSgemm<ComputeType,ABType,AccumulatorType>(ltHandle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, a, m, b, k, &beta, c, m, workspace, workspaceSize);
     
+    // Check for any errors launching the kernel
+    checkCudaStatus(cudaGetLastError());
+    
+    // Wait for the GPU to finish
+    checkCudaStatus(cudaDeviceSynchronize());
+
     checkCudaStatus(cudaFree(workspace));
 }
 #endif // KERNELS_CUH
