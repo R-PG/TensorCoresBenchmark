@@ -99,6 +99,13 @@ Matrix_2D<T>::Matrix_2D(size_t rows, size_t cols)
     : _rows(rows), _cols(cols), _data(std::make_unique<T[]>(rows * cols)), _device(allocateDevice<T>(rows * cols)) {}
 
 template <typename T>
+Matrix_2D<T>::Matrix_2D(std::unique_ptr<T[]> data, size_t rows, size_t cols) 
+    : _rows(rows), _cols(cols), _data(std::move(data))
+{
+    deviceSync();
+}
+
+template <typename T>
 Matrix_2D<T>::~Matrix_2D()
 {
     checkCudaStatus(cudaFree(_device));
