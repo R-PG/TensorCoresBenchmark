@@ -27,6 +27,7 @@ struct Matrix_2D
 
     Matrix_2D();
     Matrix_2D(size_t rows, size_t cols);
+    Matrix_2D(std::unique_ptr<T[]> data, size_t rows, size_t cols);
     Matrix_2D(Matrix_2D &&);
     Matrix_2D&& operator=(Matrix_2D&&);
     ~Matrix_2D();
